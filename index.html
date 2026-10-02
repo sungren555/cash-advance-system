@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cash Advance Management System</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -520,6 +521,10 @@
                                 <label>Description</label>
                                 <textarea id="projDesc" placeholder="Additional details" rows="4"></textarea>
                             </div>
+                            <div class="form-group form-row full">
+                                <label>Attach files (FV Excel, PDF, images - optional, max 5 MB each)</label>
+                                <input type="file" id="reqFiles" multiple accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.doc,.docx">
+                            </div>
                             <button type="submit" class="btn btn-primary">Submit Request</button>
                         </form>
                     </div>
@@ -531,14 +536,12 @@
                 <div id="verifier" class="section">
                     <h2 class="section-title">✓ Verify Requests</h2>
                     <div id="verifyRequests"></div>
-                    <div id="verifyClearInline"></div>
                 </div>
 
                 <!-- Approver -->
                 <div id="approver" class="section">
                     <h2 class="section-title">✅ Approve Requests</h2>
                     <div id="approveRequests"></div>
-                    <div id="approveClearInline"></div>
                 </div>
 
                 <!-- Disburser -->
@@ -838,6 +841,7 @@
             const date = document.getElementById('projDate').value;
             const purpose = document.getElementById('projPurpose').value;
             const description = document.getElementById('projDesc').value;
+            const files = Array.from(document.getElementById('reqFiles').files);
 
             try {
                 const response = await fetch(`${API_URL}/requests`, {
@@ -856,6 +860,13 @@
                     return;
                 }
 
+                if (files.length > 0) {
+                    try {
+                        await uploadFiles(data.request._id, files);
+                    } catch (e) {
+                        alert('Request saved, but file upload failed: ' + e.message);
+                    }
+                }
                 alert('✅ Request submitted successfully!');
                 event.target.reset();
                 loadMyRequests();
@@ -878,7 +889,7 @@
                             <div class="request-header">
                                 <div>
                                     <strong>${req.requestId} - ${req.project}</strong><br>
-                                    <small>Amount: $${req.amount}</small>${clearBlock(req)}
+                                    <small>Amount: $${req.amount}</small>${clearBlock(req)}${requestTools(req)}
                                 </div>
                                 <span class="status-badge" style="background: #667eea; color: white;">${req.status}</span>
                             </div>
@@ -897,7 +908,9 @@
                     headers: { 'Authorization': `Bearer ${token}` }
                 });
                 const requests = await response.json();
+                allRequestsData = requests;
                 document.getElementById('allRequestsList').innerHTML = requests.length === 0 ? '<p>No requests</p>' : `
+                    <button class="btn btn-primary btn-small" style="margin-bottom: 12px;" onclick="exportAllRequests()">📥 Export all to Excel</button>
                     <div style="overflow-x: auto;">
                     <table style="width: 100%; border-collapse: collapse;">
                         <thead>
@@ -917,7 +930,7 @@
                                     <td style="padding: 10px;">$${r.amount}</td>
                                     <td style="padding: 10px;">${esc(r.status)}</td>
                                     <td style="padding: 10px;">${esc(r.clearStatus || 'none')}</td>
-                                    <td style="padding: 10px;"><button class="btn btn-danger btn-small" onclick="deleteRequest('${r._id}', '${esc(r.requestId)}')">🗑️ Delete</button></td>
+                                    <td style="padding: 10px; white-space: nowrap;">${requestTools(r)} <button class="btn btn-danger btn-small" onclick="deleteRequest('${r._id}', '${esc(r.requestId)}')">🗑️ Delete</button></td>
                                 </tr>
                             `).join('')}
                         </tbody>
@@ -942,6 +955,186 @@
             } catch (error) {
                 alert('Error: ' + error.message);
             }
+        }
+
+        // ============ ATTACHMENTS & EXCEL EXPORT ============
+
+        const requestCache = {};
+        let allRequestsData = [];
+        const attachNames = {};
+
+        function requestTools(req) {
+            requestCache[req._id] = req;
+            return `<div style="margin: 8px 0;">
+                <button class="btn btn-small" style="background: #6c757d; color: white;" onclick="openAttachments('${req._id}')">📎 Attachments</button>
+                <button class="btn btn-small" style="background: #17a2b8; color: white;" onclick="exportRequest('${req._id}')">📥 Export Excel</button>
+            </div>`;
+        }
+
+        async function uploadFiles(requestId, files) {
+            const form = new FormData();
+            for (const f of files) {
+                if (f.size > 5 * 1024 * 1024) throw new Error(`${f.name} is larger than 5 MB`);
+                form.append('files', f);
+            }
+            const response = await fetch(`${API_URL}/requests/${requestId}/attachments`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}` },
+                body: form
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Upload failed');
+            return data;
+        }
+
+        function closeAttachments() {
+            const o = document.getElementById('attachOverlay');
+            if (o) o.remove();
+        }
+
+        function openAttachments(requestId) {
+            closeAttachments();
+            const req = requestCache[requestId] || {};
+            const overlay = document.createElement('div');
+            overlay.id = 'attachOverlay';
+            overlay.style.cssText = 'position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 9999;';
+            overlay.innerHTML = `
+                <div style="background: #fff; border-radius: 12px; padding: 24px; width: min(560px, 92vw); max-height: 85vh; overflow: auto;">
+                    <h3 style="margin-bottom: 12px;">📎 ${esc(req.requestId || '')} Attachments</h3>
+                    <div id="attachList">Loading...</div>
+                    <div style="margin-top: 16px; border-top: 1px solid #eee; padding-top: 16px;">
+                        <input type="file" id="attachInput" multiple accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.doc,.docx">
+                        <button class="btn btn-primary btn-small" onclick="uploadFromModal('${requestId}')">Upload</button>
+                        <p style="font-size: 12px; color: #666; margin-top: 6px;">Excel (FV), PDF, images, Word. Max 5 MB each, 10 files per request.</p>
+                    </div>
+                    <button class="btn btn-small" style="margin-top: 12px;" onclick="closeAttachments()">Close</button>
+                </div>`;
+            overlay.addEventListener('click', e => { if (e.target === overlay) closeAttachments(); });
+            document.body.appendChild(overlay);
+            loadAttachmentList(requestId);
+        }
+
+        async function loadAttachmentList(requestId) {
+            const box = document.getElementById('attachList');
+            if (!box) return;
+            try {
+                const response = await fetch(`${API_URL}/requests/${requestId}/attachments`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const list = await response.json();
+                if (!response.ok) { box.textContent = list.error || 'Failed to load files'; return; }
+                box.innerHTML = list.length === 0 ? '<p>No files attached</p>' : list.map(a => {
+                    attachNames[a._id] = a.filename;
+                    const canDelete = currentUser.role === 'admin' || a.uploadedBy === currentUser.id;
+                    return `<div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #eee;">
+                        <div style="min-width: 0;">
+                            <strong style="word-break: break-all;">${esc(a.filename)}</strong><br>
+                            <small>${(a.size / 1024).toFixed(1)} KB - ${esc(a.uploadedByName)} (${esc(a.uploadedByRole)}), ${new Date(a.createdAt).toLocaleString()}</small>
+                        </div>
+                        <div style="white-space: nowrap;">
+                            <button class="btn btn-small" style="background: #28a745; color: white;" onclick="downloadAttachment('${a._id}')">⬇️</button>
+                            ${canDelete ? `<button class="btn btn-danger btn-small" onclick="deleteAttachment('${a._id}', '${requestId}')">🗑️</button>` : ''}
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch (error) {
+                box.textContent = 'Error: ' + error.message;
+            }
+        }
+
+        async function uploadFromModal(requestId) {
+            const input = document.getElementById('attachInput');
+            const files = Array.from(input.files);
+            if (files.length === 0) { alert('Please choose a file first'); return; }
+            try {
+                await uploadFiles(requestId, files);
+                input.value = '';
+                loadAttachmentList(requestId);
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+
+        async function downloadAttachment(id) {
+            try {
+                const response = await fetch(`${API_URL}/attachments/${id}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                if (!response.ok) {
+                    const data = await response.json();
+                    alert(data.error || 'Download failed');
+                    return;
+                }
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = attachNames[id] || 'file';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+
+        async function deleteAttachment(id, requestId) {
+            if (!confirm('Delete this file?')) return;
+            try {
+                const response = await fetch(`${API_URL}/attachments/${id}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const data = await response.json();
+                if (!response.ok) { alert(data.error || 'Delete failed'); return; }
+                loadAttachmentList(requestId);
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+
+        function fmtDate(d) {
+            return d ? new Date(d).toLocaleString() : '';
+        }
+
+        function exportRequest(id) {
+            const r = requestCache[id];
+            if (!r) return;
+            if (typeof XLSX === 'undefined') { alert('Excel library did not load. Check the internet connection and refresh.'); return; }
+            const c = r.clear || {};
+            const info = [
+                ['Cash Advance Request'], [],
+                ['Request ID', r.requestId], ['Project', r.project], ['Requestor', r.requestor], ['Email', r.requestorEmail],
+                ['Date', r.date ? new Date(r.date).toLocaleDateString() : ''], ['Purpose', r.purpose || ''],
+                ['Description', r.description], ['Amount ($)', r.amount], ['Status', r.status], [],
+                ['Cash Advance Clear'], ['Clear status', r.clearStatus || 'none'],
+                ['Amount spent ($)', c.amountSpent ?? ''], ['Amount returned ($)', c.amountReturned ?? ''], ['Clear note', c.note || '']
+            ];
+            const trail = [['Action', 'By', 'Date'], ...(r.timeline || []).map(t => [t.action, t.user, fmtDate(t.date)])];
+            const wb = XLSX.utils.book_new();
+            const ws1 = XLSX.utils.aoa_to_sheet(info);
+            ws1['!cols'] = [{ wch: 22 }, { wch: 60 }];
+            const ws2 = XLSX.utils.aoa_to_sheet(trail);
+            ws2['!cols'] = [{ wch: 22 }, { wch: 26 }, { wch: 24 }];
+            XLSX.utils.book_append_sheet(wb, ws1, 'Request');
+            XLSX.utils.book_append_sheet(wb, ws2, 'Approval Trail');
+            XLSX.writeFile(wb, `${r.requestId || 'request'}.xlsx`);
+        }
+
+        function exportAllRequests() {
+            if (typeof XLSX === 'undefined') { alert('Excel library did not load. Check the internet connection and refresh.'); return; }
+            const rows = [['Request ID', 'Project', 'Requestor', 'Email', 'Date', 'Purpose', 'Description', 'Amount ($)', 'Status', 'Clear status', 'Spent ($)', 'Returned ($)']];
+            allRequestsData.forEach(r => {
+                const c = r.clear || {};
+                rows.push([r.requestId, r.project, r.requestor, r.requestorEmail, r.date ? new Date(r.date).toLocaleDateString() : '',
+                    r.purpose || '', r.description, r.amount, r.status, r.clearStatus || 'none', c.amountSpent ?? '', c.amountReturned ?? '']);
+            });
+            const ws = XLSX.utils.aoa_to_sheet(rows);
+            ws['!cols'] = [{ wch: 12 }, { wch: 24 }, { wch: 20 }, { wch: 26 }, { wch: 12 }, { wch: 24 }, { wch: 36 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 10 }, { wch: 12 }];
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, 'All Requests');
+            XLSX.writeFile(wb, 'cash-advance-requests.xlsx');
         }
 
         // ============ CASH ADVANCE CLEAR ============
@@ -990,7 +1183,6 @@
 
         async function loadClearList(stage) {
             const target = document.getElementById(stage === 'submitted' ? 'verifyClearList' : 'approveClearList');
-            const inline = document.getElementById(stage === 'submitted' ? 'verifyClearInline' : 'approveClearInline');
             const action = stage === 'submitted' ? 'Verify' : 'Approve';
             try {
                 const response = await fetch(`${API_URL}/clears/${stage}`, {
@@ -1003,13 +1195,12 @@
                         <p>Requestor: ${esc(req.requestor)}</p>
                         <p>Advance: $${req.amount} | Spent: $${req.clear.amountSpent} | Returned: $${req.clear.amountReturned}</p>
                         <p>${esc(req.clear.note)}</p>
+                        ${requestTools(req)}
                         <button class="btn btn-success" onclick="clearAction('${req._id}', 'approve-or-verify', '${stage}')">${action}</button>
                         <button class="btn btn-danger" onclick="clearAction('${req._id}', 'reject', '${stage}')">Reject</button>
                     </div>
                 `).join('');
                 target.innerHTML = requests.length === 0 ? '<p>No clears waiting</p>' : cards;
-                inline.innerHTML = requests.length === 0 ? '' :
-                    `<h3 style="margin: 28px 0 12px;">🧾 Cash Advance Clear waiting (${requests.length})</h3>` + cards;
             } catch (error) {
                 console.error(error);
             }
@@ -1039,7 +1230,6 @@
         }
 
         async function loadVerifyRequests() {
-            loadClearList('submitted');
             try {
                 const response = await fetch(`${API_URL}/requests/status/pending`, {
                     headers: { 'Authorization': `Bearer ${token}` }
@@ -1052,6 +1242,7 @@
                         <div class="card">
                             <h4>${req.project} - $${req.amount}</h4>
                             <p>${req.description}</p>
+                            ${requestTools(req)}
                             <button class="btn btn-success" onclick="verifyRequest('${req._id}')">Verify</button>
                             <button class="btn btn-danger" onclick="rejectRequest('${req._id}')">Reject</button>
                         </div>
@@ -1092,7 +1283,6 @@
         }
 
         async function loadApproveRequests() {
-            loadClearList('verified');
             try {
                 const response = await fetch(`${API_URL}/requests/status/verified`, {
                     headers: { 'Authorization': `Bearer ${token}` }
@@ -1105,6 +1295,7 @@
                         <div class="card">
                             <h4>${req.project} - $${req.amount}</h4>
                             <p>${req.description}</p>
+                            ${requestTools(req)}
                             <button class="btn btn-success" onclick="approveRequest('${req._id}')">Approve</button>
                             <button class="btn btn-danger" onclick="rejectRequest('${req._id}')">Reject</button>
                         </div>

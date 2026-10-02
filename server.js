@@ -3,6 +3,8 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
 require('dotenv').config();
 
 if (!process.env.JWT_SECRET) {
@@ -42,6 +44,7 @@ const requestSchema = new mongoose.Schema({
     requestor: { type: String, required: true },
     requestorEmail: { type: String, required: true },
     amount: { type: Number, required: true },
+    purpose: { type: String },
     project: { type: String, required: true },
     description: { type: String, required: true },
     status: { type: String, enum: ['pending', 'verified', 'approved', 'disbursed', 'rejected', 'denied'], default: 'pending' },
@@ -64,8 +67,21 @@ const requestSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
+// Attachment Schema (files are stored in MongoDB so they survive Railway redeploys)
+const attachmentSchema = new mongoose.Schema({
+    requestId: { type: mongoose.Schema.Types.ObjectId, ref: 'Request', required: true, index: true },
+    filename: { type: String, required: true },
+    size: { type: Number, required: true },
+    data: { type: Buffer, required: true },
+    uploadedBy: { type: mongoose.Schema.Types.ObjectId, required: true },
+    uploadedByName: String,
+    uploadedByRole: String,
+    createdAt: { type: Date, default: Date.now }
+});
+
 const User = mongoose.model('User', userSchema);
 const Request = mongoose.model('Request', requestSchema);
+const Attachment = mongoose.model('Attachment', attachmentSchema);
 
 // ============ HELPER FUNCTIONS ============
 
@@ -243,7 +259,7 @@ app.delete('/api/users/:userId', auth, checkRole(['admin']), async (req, res) =>
 // Create request
 app.post('/api/requests', auth, checkRole(['requestor', 'admin']), async (req, res) => {
     try {
-        const { project, amount, description } = req.body;
+        const { project, amount, description, purpose, date } = req.body;
 
         const lastRequest = await Request.findOne().sort({ createdAt: -1 });
         const requestNumber = lastRequest ? parseInt(lastRequest.requestId.split('-')[1]) + 1 : 1;
@@ -256,6 +272,8 @@ app.post('/api/requests', auth, checkRole(['requestor', 'admin']), async (req, r
             requestorEmail: req.user.email,
             project,
             amount,
+            purpose,
+            date: date ? new Date(date) : undefined,
             description,
             timeline: [{
                 action: 'Requested',
@@ -367,7 +385,7 @@ app.put('/api/requests/:requestId/disburse', auth, checkRole(['disburser', 'admi
 });
 
 // Reject request
-app.put('/api/requests/:requestId/reject', auth, checkRole(['verifier', 'admin']), async (req, res) => {
+app.put('/api/requests/:requestId/reject', auth, checkRole(['verifier', 'approver', 'admin']), async (req, res) => {
     try {
         const request = await Request.findByIdAndUpdate(
             req.params.requestId,
@@ -487,6 +505,110 @@ app.put('/api/requests/:requestId/clear/reject', auth, checkRole(['verifier', 'a
     }
 });
 
+
+// ============ ATTACHMENTS (FV Excel, PDF, images) ============
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 5 } });
+const ALLOWED_EXT = ['.xlsx', '.xls', '.csv', '.pdf', '.png', '.jpg', '.jpeg', '.doc', '.docx'];
+
+// Requestors only see their own requests; every other role can see all
+const canAccess = (user, request) =>
+    user.role !== 'requestor' || request.requestorId.toString() === user._id.toString();
+
+app.post('/api/requests/:requestId/attachments', auth, checkRole(['requestor', 'verifier', 'approver', 'admin']),
+    (req, res, next) => upload.array('files', 5)(req, res, (err) => {
+        if (err) {
+            return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'File too large (max 5 MB each)' : err.message });
+        }
+        next();
+    }),
+    async (req, res) => {
+        try {
+            const request = await Request.findById(req.params.requestId);
+            if (!request) return res.status(404).json({ error: 'Request not found' });
+            if (!canAccess(req.user, request)) return res.status(403).json({ error: 'Not authorized' });
+
+            const files = req.files || [];
+            if (files.length === 0) return res.status(400).json({ error: 'No file selected' });
+
+            const existing = await Attachment.countDocuments({ requestId: request._id });
+            if (existing + files.length > 10) return res.status(400).json({ error: 'Maximum 10 files per request' });
+
+            const prepared = files.map(f => ({
+                // multer decodes names as latin1; restore UTF-8 (Khmer file names)
+                name: Buffer.from(f.originalname, 'latin1').toString('utf8'),
+                file: f
+            }));
+            for (const p of prepared) {
+                const ext = path.extname(p.name).toLowerCase();
+                if (!ALLOWED_EXT.includes(ext)) {
+                    return res.status(400).json({ error: `File type ${ext || '(none)'} is not allowed` });
+                }
+            }
+
+            const saved = [];
+            for (const p of prepared) {
+                const att = await Attachment.create({
+                    requestId: request._id,
+                    filename: p.name,
+                    size: p.file.size,
+                    data: p.file.buffer,
+                    uploadedBy: req.user._id,
+                    uploadedByName: req.user.fullName,
+                    uploadedByRole: req.user.role
+                });
+                saved.push({ _id: att._id, filename: att.filename, size: att.size });
+            }
+            res.status(201).json({ message: 'Uploaded', files: saved });
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
+    }
+);
+
+app.get('/api/requests/:requestId/attachments', auth, async (req, res) => {
+    try {
+        const request = await Request.findById(req.params.requestId);
+        if (!request) return res.status(404).json({ error: 'Request not found' });
+        if (!canAccess(req.user, request)) return res.status(403).json({ error: 'Not authorized' });
+        const list = await Attachment.find({ requestId: request._id }).select('-data').sort({ createdAt: 1 });
+        res.json(list);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/attachments/:id', auth, async (req, res) => {
+    try {
+        const att = await Attachment.findById(req.params.id);
+        if (!att) return res.status(404).json({ error: 'File not found' });
+        const request = await Request.findById(att.requestId);
+        if (!request || !canAccess(req.user, request)) return res.status(403).json({ error: 'Not authorized' });
+        res.set({
+            'Content-Type': 'application/octet-stream',
+            'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(att.filename)}`,
+            'X-Content-Type-Options': 'nosniff'
+        });
+        res.send(att.data);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/attachments/:id', auth, async (req, res) => {
+    try {
+        const att = await Attachment.findById(req.params.id).select('-data');
+        if (!att) return res.status(404).json({ error: 'File not found' });
+        if (req.user.role !== 'admin' && att.uploadedBy.toString() !== req.user._id.toString()) {
+            return res.status(403).json({ error: 'Only the uploader or an admin can delete this file' });
+        }
+        await Attachment.findByIdAndDelete(att._id);
+        res.json({ message: 'File deleted' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Delete request
 app.delete('/api/requests/:requestId', auth, async (req, res) => {
     try {
@@ -501,6 +623,7 @@ app.delete('/api/requests/:requestId', auth, async (req, res) => {
             }
         }
         
+        await Attachment.deleteMany({ requestId: request._id });
         await Request.findByIdAndDelete(req.params.requestId);
         res.json({ message: 'Request deleted' });
     } catch (error) {
