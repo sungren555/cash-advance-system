@@ -559,6 +559,12 @@
                     <div id="approveClearList"></div>
                 </div>
 
+                <!-- All Requests (Admin) -->
+                <div id="allRequests" class="section">
+                    <h2 class="section-title">🗂️ All Requests</h2>
+                    <div id="allRequestsList"></div>
+                </div>
+
                 <!-- User Management (Admin) -->
                 <div id="users" class="section">
                     <h2 class="section-title">👥 User Management</h2>
@@ -732,6 +738,7 @@
                 items.push({ id: 'approveClear', label: '🧾 Approve Clear' });
             }
             if (currentUser.role === 'admin') {
+                items.push({ id: 'allRequests', label: '🗂️ All Requests' });
                 items.push({ id: 'users', label: '👥 User Management' });
             }
 
@@ -753,6 +760,7 @@
             else if (sectionId === 'disburser') loadDisburseRequests();
             else if (sectionId === 'verifyClear') loadClearList('submitted');
             else if (sectionId === 'approveClear') loadClearList('verified');
+            else if (sectionId === 'allRequests') loadAllRequests();
             else if (sectionId === 'users') loadUsers();
         }
 
@@ -878,6 +886,61 @@
                     `).join('');
             } catch (error) {
                 console.error(error);
+            }
+        }
+
+        // ============ ADMIN: ALL REQUESTS / DELETE ============
+
+        async function loadAllRequests() {
+            try {
+                const response = await fetch(`${API_URL}/requests`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const requests = await response.json();
+                document.getElementById('allRequestsList').innerHTML = requests.length === 0 ? '<p>No requests</p>' : `
+                    <div style="overflow-x: auto;">
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <thead>
+                            <tr style="text-align: left; border-bottom: 2px solid #ddd;">
+                                <th style="padding: 10px;">ID</th><th style="padding: 10px;">Project</th>
+                                <th style="padding: 10px;">Requestor</th><th style="padding: 10px;">Amount</th>
+                                <th style="padding: 10px;">Status</th><th style="padding: 10px;">Clear</th>
+                                <th style="padding: 10px;"></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${requests.map(r => `
+                                <tr style="border-bottom: 1px solid #eee;">
+                                    <td style="padding: 10px;">${esc(r.requestId)}</td>
+                                    <td style="padding: 10px;">${esc(r.project)}</td>
+                                    <td style="padding: 10px;">${esc(r.requestor)}</td>
+                                    <td style="padding: 10px;">$${r.amount}</td>
+                                    <td style="padding: 10px;">${esc(r.status)}</td>
+                                    <td style="padding: 10px;">${esc(r.clearStatus || 'none')}</td>
+                                    <td style="padding: 10px;"><button class="btn btn-danger btn-small" onclick="deleteRequest('${r._id}', '${esc(r.requestId)}')">🗑️ Delete</button></td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                    </div>`;
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
+        async function deleteRequest(id, label) {
+            if (!confirm(`Delete ${label} permanently? This cannot be undone.`)) return;
+            try {
+                const response = await fetch(`${API_URL}/requests/${id}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const data = await response.json();
+                if (!response.ok) { alert(data.error || 'Failed to delete'); return; }
+                alert('🗑️ Request deleted');
+                loadAllRequests();
+            } catch (error) {
+                alert('Error: ' + error.message);
             }
         }
 

@@ -491,9 +491,14 @@ app.put('/api/requests/:requestId/clear/reject', auth, checkRole(['verifier', 'a
 app.delete('/api/requests/:requestId', auth, async (req, res) => {
     try {
         const request = await Request.findById(req.params.requestId);
-        
-        if (request.requestorId.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-            return res.status(403).json({ error: 'Not authorized' });
+        if (!request) return res.status(404).json({ error: 'Request not found' });
+
+        const isOwner = request.requestorId.toString() === req.user._id.toString();
+        if (req.user.role !== 'admin') {
+            // Non-admins may only delete their own request while it is still pending
+            if (!isOwner || request.status !== 'pending') {
+                return res.status(403).json({ error: 'Only an admin can delete this request' });
+            }
         }
         
         await Request.findByIdAndDelete(req.params.requestId);
