@@ -5,6 +5,11 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 require('dotenv').config();
 
+if (!process.env.JWT_SECRET) {
+    console.error('JWT_SECRET is not set. Refusing to start.');
+    process.exit(1);
+}
+
 const app = express();
 
 // Middleware
@@ -57,12 +62,12 @@ const Request = mongoose.model('Request', requestSchema);
 // ============ HELPER FUNCTIONS ============
 
 const generateToken = (userId) => {
-    return jwt.sign({ userId }, process.env.JWT_SECRET || 'your-secret-key', { expiresIn: '7d' });
+    return jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '7d' });
 };
 
 const verifyToken = (token) => {
     try {
-        return jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+        return jwt.verify(token, process.env.JWT_SECRET);
     } catch (err) {
         return null;
     }
@@ -105,13 +110,18 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(400).json({ error: 'User already exists' });
         }
         
+        // Security: public registration can never choose a role.
+        // Only the very first user (empty database) becomes admin.
+        const userCount = await User.countDocuments();
+        const assignedRole = userCount === 0 ? 'admin' : 'requestor';
+
         const hashedPassword = await bcrypt.hash(password, 10);
         const user = new User({
             username,
             email,
             password: hashedPassword,
             fullName,
-            role: role || 'admin'
+            role: assignedRole
         });
         
         await user.save();
@@ -269,7 +279,7 @@ app.get('/api/requests', auth, async (req, res) => {
 });
 
 // Get filtered requests by status
-app.get('/api/requests/status/:status', auth, async (req, res) => {
+app.get('/api/requests/status/:status', auth, checkRole(['verifier', 'approver', 'disburser', 'admin']), async (req, res) => {
     try {
         const requests = await Request.find({ status: req.params.status }).populate('requestorId', '-password');
         res.json(requests);
@@ -410,15 +420,16 @@ app.get('/api/dashboard/stats', auth, async (req, res) => {
 
 // ============ SERVE STATIC FILES & FRONTEND ============
 
-// Serve static files from current directory
-app.use(express.static('./'));
-
 // Serve index.html for root path
 app.get('/', (req, res) => {
     res.sendFile(__dirname + '/index.html');
 });
 
-// Catch-all route - serve index.html for any unknown routes
+// Unknown API routes return JSON, everything else gets the frontend
+app.use('/api', (req, res) => {
+    res.status(404).json({ error: 'API route not found' });
+});
+
 app.use((req, res) => {
     res.sendFile(__dirname + '/index.html');
 });
