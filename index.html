@@ -545,6 +545,18 @@
                     <div id="disburseRequests"></div>
                 </div>
 
+                <!-- Verify Clear -->
+                <div id="verifyClear" class="section">
+                    <h2 class="section-title">🧾 Verify Cash Advance Clear</h2>
+                    <div id="verifyClearList"></div>
+                </div>
+
+                <!-- Approve Clear -->
+                <div id="approveClear" class="section">
+                    <h2 class="section-title">🧾 Approve Cash Advance Clear</h2>
+                    <div id="approveClearList"></div>
+                </div>
+
                 <!-- User Management (Admin) -->
                 <div id="users" class="section">
                     <h2 class="section-title">👥 User Management</h2>
@@ -711,6 +723,12 @@
             if (['disburser', 'admin'].includes(currentUser.role)) {
                 items.push({ id: 'disburser', label: '💳 Disbursement' });
             }
+            if (['verifier', 'admin'].includes(currentUser.role)) {
+                items.push({ id: 'verifyClear', label: '🧾 Verify Clear' });
+            }
+            if (['approver', 'admin'].includes(currentUser.role)) {
+                items.push({ id: 'approveClear', label: '🧾 Approve Clear' });
+            }
             if (currentUser.role === 'admin') {
                 items.push({ id: 'users', label: '👥 User Management' });
             }
@@ -731,6 +749,8 @@
             else if (sectionId === 'verifier') loadVerifyRequests();
             else if (sectionId === 'approver') loadApproveRequests();
             else if (sectionId === 'disburser') loadDisburseRequests();
+            else if (sectionId === 'verifyClear') loadClearList('submitted');
+            else if (sectionId === 'approveClear') loadClearList('verified');
             else if (sectionId === 'users') loadUsers();
         }
 
@@ -848,7 +868,7 @@
                             <div class="request-header">
                                 <div>
                                     <strong>${req.requestId} - ${req.project}</strong><br>
-                                    <small>Amount: $${req.amount}</small>
+                                    <small>Amount: $${req.amount}</small>${clearBlock(req)}
                                 </div>
                                 <span class="status-badge" style="background: #667eea; color: white;">${req.status}</span>
                             </div>
@@ -856,6 +876,96 @@
                     `).join('');
             } catch (error) {
                 console.error(error);
+            }
+        }
+
+        // ============ CASH ADVANCE CLEAR ============
+
+        function esc(v) {
+            return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+
+        function clearBlock(req) {
+            if (req.status !== 'disbursed') return '';
+            const st = req.clearStatus || 'none';
+            if (st === 'cleared') return '<br><small style="color: #28a745;">✅ Advance cleared</small>';
+            if (st === 'submitted') return '<br><small style="color: #b8860b;">🧾 Clear submitted - waiting for verification</small>';
+            if (st === 'verified') return '<br><small style="color: #b8860b;">🧾 Clear verified - waiting for approval</small>';
+            const reason = st === 'rejected' && req.clear && req.clear.rejectReason
+                ? `<br><small style="color: #dc3545;">❌ Clear rejected: ${esc(req.clear.rejectReason)}</small>` : '';
+            return `${reason}<br><button class="btn btn-primary btn-small" style="margin-top: 8px;" onclick="submitClear('${req._id}', ${Number(req.amount)})">🧾 Clear Advance</button>`;
+        }
+
+        async function submitClear(requestId, advance) {
+            const spentInput = prompt(`Cash advance: $${advance}\nHow much did you spend? ($)`);
+            if (spentInput === null) return;
+            const amountSpent = parseFloat(spentInput);
+            if (isNaN(amountSpent) || amountSpent < 0 || amountSpent > advance) {
+                alert('Amount spent must be between 0 and ' + advance);
+                return;
+            }
+            const amountReturned = Math.round((advance - amountSpent) * 100) / 100;
+            const note = prompt(`Spent: $${amountSpent}  |  Return cash: $${amountReturned}\nNote / receipt details (optional):`);
+            if (note === null) return;
+
+            try {
+                const response = await fetch(`${API_URL}/requests/${requestId}/clear`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({ amountSpent, amountReturned, note })
+                });
+                const data = await response.json();
+                if (!response.ok) { alert(data.error || 'Failed to submit clear'); return; }
+                alert('✅ Clear submitted!');
+                loadMyRequests();
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+
+        async function loadClearList(stage) {
+            const target = document.getElementById(stage === 'submitted' ? 'verifyClearList' : 'approveClearList');
+            const action = stage === 'submitted' ? 'Verify' : 'Approve';
+            try {
+                const response = await fetch(`${API_URL}/clears/${stage}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const requests = await response.json();
+                target.innerHTML = requests.length === 0 ? '<p>No clears waiting</p>' : requests.map(req => `
+                    <div class="card">
+                        <h4>${esc(req.requestId)} - ${esc(req.project)}</h4>
+                        <p>Requestor: ${esc(req.requestor)}</p>
+                        <p>Advance: $${req.amount} | Spent: $${req.clear.amountSpent} | Returned: $${req.clear.amountReturned}</p>
+                        <p>${esc(req.clear.note)}</p>
+                        <button class="btn btn-success" onclick="clearAction('${req._id}', 'approve-or-verify', '${stage}')">${action}</button>
+                        <button class="btn btn-danger" onclick="clearAction('${req._id}', 'reject', '${stage}')">Reject</button>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
+        async function clearAction(requestId, action, stage) {
+            const path = action === 'reject' ? 'reject' : (stage === 'submitted' ? 'verify' : 'approve');
+            let body = {};
+            if (path === 'reject') {
+                const reason = prompt('Reason for rejecting this clear:');
+                if (reason === null) return;
+                body = { reason };
+            }
+            try {
+                const response = await fetch(`${API_URL}/requests/${requestId}/clear/${path}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify(body)
+                });
+                const data = await response.json();
+                if (!response.ok) { alert(data.error || 'Action failed'); return; }
+                alert('✅ Done!');
+                loadClearList(stage);
+            } catch (error) {
+                alert('Error: ' + error.message);
             }
         }
 
