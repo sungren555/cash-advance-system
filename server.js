@@ -47,6 +47,14 @@ const requestSchema = new mongoose.Schema({
     status: { type: String, enum: ['pending', 'verified', 'approved', 'disbursed', 'rejected', 'denied'], default: 'pending' },
     date: { type: Date, default: Date.now },
     file: { type: String },
+    clearStatus: { type: String, enum: ['none', 'submitted', 'verified', 'cleared', 'rejected'], default: 'none' },
+    clear: {
+        amountSpent: Number,
+        amountReturned: Number,
+        note: String,
+        rejectReason: String,
+        submittedAt: Date
+    },
     timeline: [{
         action: String,
         user: String,
@@ -236,6 +244,7 @@ app.delete('/api/users/:userId', auth, checkRole(['admin']), async (req, res) =>
 app.post('/api/requests', auth, checkRole(['requestor', 'admin']), async (req, res) => {
     try {
         const { project, amount, description } = req.body;
+
         const lastRequest = await Request.findOne().sort({ createdAt: -1 });
         const requestNumber = lastRequest ? parseInt(lastRequest.requestId.split('-')[1]) + 1 : 1;
         const requestId = `ADV-${String(requestNumber).padStart(3, '0')}`;
@@ -375,6 +384,104 @@ app.put('/api/requests/:requestId/reject', auth, checkRole(['verifier', 'admin']
             { new: true }
         );
         res.json({ message: 'Request rejected', request });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+
+// ============ CASH ADVANCE CLEAR ============
+
+const sameUser = (a, b) => a.toString() === b.toString();
+
+// Requestor submits the clear (after disbursement)
+app.put('/api/requests/:requestId/clear', auth, checkRole(['requestor', 'admin']), async (req, res) => {
+    try {
+        const request = await Request.findById(req.params.requestId);
+        if (!request) return res.status(404).json({ error: 'Request not found' });
+        if (!sameUser(request.requestorId, req.user._id)) return res.status(403).json({ error: 'Not authorized' });
+        if (request.status !== 'disbursed') return res.status(400).json({ error: 'Only disbursed requests can be cleared' });
+        if (!['none', 'rejected'].includes(request.clearStatus || 'none')) {
+            return res.status(400).json({ error: 'Clear already submitted' });
+        }
+
+        const spent = Number(req.body.amountSpent);
+        const returned = Number(req.body.amountReturned);
+        if (!Number.isFinite(spent) || !Number.isFinite(returned) || spent < 0 || returned < 0) {
+            return res.status(400).json({ error: 'Invalid amounts' });
+        }
+        if (Math.abs(spent + returned - request.amount) > 0.005) {
+            return res.status(400).json({ error: `Amount spent + amount returned must equal the advance ($${request.amount})` });
+        }
+
+        request.clearStatus = 'submitted';
+        request.clear = { amountSpent: spent, amountReturned: returned, note: req.body.note || '', submittedAt: new Date() };
+        request.timeline.push({ action: 'Clear submitted', user: req.user.fullName, userId: req.user._id });
+        await request.save();
+        res.json({ message: 'Clear submitted', request });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// List clears waiting at a stage: submitted (verifier) or verified (approver)
+app.get('/api/clears/:stage', auth, checkRole(['verifier', 'approver', 'admin']), async (req, res) => {
+    try {
+        if (!['submitted', 'verified'].includes(req.params.stage)) return res.status(400).json({ error: 'Invalid stage' });
+        const requests = await Request.find({ status: 'disbursed', clearStatus: req.params.stage }).populate('requestorId', '-password');
+        res.json(requests);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Verifier checks the clear
+app.put('/api/requests/:requestId/clear/verify', auth, checkRole(['verifier', 'admin']), async (req, res) => {
+    try {
+        const request = await Request.findById(req.params.requestId);
+        if (!request) return res.status(404).json({ error: 'Request not found' });
+        if (request.clearStatus !== 'submitted') return res.status(400).json({ error: 'Clear is not waiting for verification' });
+        request.clearStatus = 'verified';
+        request.timeline.push({ action: 'Clear verified', user: req.user.fullName, userId: req.user._id });
+        await request.save();
+        res.json({ message: 'Clear verified', request });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Approver approves the clear
+app.put('/api/requests/:requestId/clear/approve', auth, checkRole(['approver', 'admin']), async (req, res) => {
+    try {
+        const request = await Request.findById(req.params.requestId);
+        if (!request) return res.status(404).json({ error: 'Request not found' });
+        if (request.clearStatus !== 'verified') return res.status(400).json({ error: 'Clear is not waiting for approval' });
+        request.clearStatus = 'cleared';
+        request.timeline.push({ action: 'Clear approved', user: req.user.fullName, userId: req.user._id });
+        await request.save();
+        res.json({ message: 'Clear approved', request });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Verifier (at submitted) or approver (at verified) sends the clear back to the requestor
+app.put('/api/requests/:requestId/clear/reject', auth, checkRole(['verifier', 'approver', 'admin']), async (req, res) => {
+    try {
+        const request = await Request.findById(req.params.requestId);
+        if (!request) return res.status(404).json({ error: 'Request not found' });
+        const stage = request.clearStatus;
+        const allowed = req.user.role === 'admin' ||
+            (req.user.role === 'verifier' && stage === 'submitted') ||
+            (req.user.role === 'approver' && stage === 'verified');
+        if (!['submitted', 'verified'].includes(stage) || !allowed) {
+            return res.status(400).json({ error: 'Clear cannot be rejected at this stage' });
+        }
+        request.clearStatus = 'rejected';
+        request.clear.rejectReason = req.body.reason || '';
+        request.timeline.push({ action: 'Clear rejected', user: req.user.fullName, userId: req.user._id });
+        await request.save();
+        res.json({ message: 'Clear rejected', request });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
