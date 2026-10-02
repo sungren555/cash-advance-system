@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cash Advance Management System</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -1007,6 +1008,7 @@
                         <button class="btn btn-primary btn-small" onclick="uploadFromModal('${requestId}')">Upload</button>
                         <p style="font-size: 12px; color: #666; margin-top: 6px;">Excel (FV), PDF, images, Word. Max 5 MB each, 10 files per request.</p>
                     </div>
+                    <button class="btn btn-small" style="margin-top: 12px; background: #17a2b8; color: white;" onclick="downloadZip('${requestId}')">📦 Download all (ZIP)</button>
                     <button class="btn btn-small" style="margin-top: 12px;" onclick="closeAttachments()">Close</button>
                 </div>`;
             overlay.addEventListener('click', e => { if (e.target === overlay) closeAttachments(); });
@@ -1098,7 +1100,7 @@
             return d ? new Date(d).toLocaleString() : '';
         }
 
-        function exportRequest(id) {
+        function exportRequest(id, asBytes) {
             const r = requestCache[id];
             if (!r) return;
             if (typeof XLSX === 'undefined') { alert('Excel library did not load. Check the internet connection and refresh.'); return; }
@@ -1119,7 +1121,53 @@
             ws2['!cols'] = [{ wch: 22 }, { wch: 26 }, { wch: 24 }];
             XLSX.utils.book_append_sheet(wb, ws1, 'Request');
             XLSX.utils.book_append_sheet(wb, ws2, 'Approval Trail');
+            if (asBytes) return XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
             XLSX.writeFile(wb, `${r.requestId || 'request'}.xlsx`);
+        }
+
+        async function downloadZip(requestId) {
+            if (typeof JSZip === 'undefined') { alert('ZIP library did not load. Check the internet connection and refresh.'); return; }
+            const r = requestCache[requestId];
+            if (!r) return;
+            try {
+                const listRes = await fetch(`${API_URL}/requests/${requestId}/attachments`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const list = await listRes.json();
+                if (!listRes.ok) throw new Error(list.error || 'Failed to load files');
+
+                const zip = new JSZip();
+                const bytes = exportRequest(requestId, true);
+                if (bytes) zip.file(`${r.requestId}.xlsx`, bytes);
+
+                const folder = zip.folder('attachments');
+                const used = {};
+                for (const a of list) {
+                    const res = await fetch(`${API_URL}/attachments/${a._id}`, {
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    });
+                    if (!res.ok) throw new Error(`Failed to download ${a.filename}`);
+                    let name = a.filename;
+                    const n = used[name] = (used[name] || 0) + 1;
+                    if (n > 1) {
+                        const dot = name.lastIndexOf('.');
+                        name = dot > 0 ? `${name.slice(0, dot)} (${n})${name.slice(dot)}` : `${name} (${n})`;
+                    }
+                    folder.file(name, await res.blob());
+                }
+
+                const blob = await zip.generateAsync({ type: 'blob' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `${r.requestId}.zip`;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
         }
 
         function exportAllRequests() {
